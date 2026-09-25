@@ -63,7 +63,11 @@ sudo systemctl start wg-quick@cascade
 ```
 
 Выключить: `sudo systemctl stop wg-quick@cascade`.
-Если на компьютере выключен IPv6, убери `, ::/0` из строки `AllowedIPs`.
+
+Если wg-quick ругается на resolvconf (в Ubuntu его по умолчанию нет или стоит старый пакет),
+один раз выполни:
+  sudo apt purge -y resolvconf
+  sudo ln -s /usr/bin/resolvectl /usr/local/sbin/resolvconf
 
 ## Если перестало работать
 
