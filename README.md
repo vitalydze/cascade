@@ -19,7 +19,7 @@
 Зайти по SSH на **российский** сервер и выполнить:
 
 ```bash
-wget -O /usr/local/bin/cascade https://raw.githubusercontent.com/USER/cascade-vpn/main/cascade.sh
+wget -O /usr/local/bin/cascade https://raw.githubusercontent.com/vitalydze/cascade/main/cascade.sh
 chmod +x /usr/local/bin/cascade
 cascade install <IP зарубежного сервера>
 ```
