@@ -14,6 +14,7 @@
 #   cascade list           клиенты и когда подключались
 #   cascade status         состояние служб
 #   cascade test           проверить, что трафик идёт через зарубежный сервер
+#   cascade log <имя>      лог клиента: рукопожатия WireGuard, трафик, соединения (Ctrl+C — выход)
 
 set -e
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
@@ -22,6 +23,7 @@ SNI=www.nvidia.com   # под какой сайт маскируется зар�
 WG_NET=10.66.66      # подсеть клиентов: сервер .1, клиенты .2, .3, ...
 DIR=/etc/cascade     # ключи и настройки (файл env)
 CLIENTS=/root/cascade  # конфиги клиентов, отсюда их забирать по SFTP
+LOGS=/var/log/cascade  # логи по клиентам (<имя>.log) и TCP-соединений между серверами (tcp.log)
 
 XRAY_INSTALL=https://github.com/XTLS/Xray-install/raw/main/install-release.sh
 
@@ -52,7 +54,7 @@ EOF
 de_config() {
   cat <<EOF
 {
-  "log": { "loglevel": "warning", "access": "none" },
+  "log": { "loglevel": "info", "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log" },
   "inbounds": [{
     "port": 443,
     "protocol": "vless",
@@ -89,9 +91,10 @@ EOF
 ru_config() {
   cat <<EOF
 {
-  "log": { "loglevel": "warning", "access": "none" },
+  "log": { "loglevel": "info", "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log" },
   "inbounds": [
     {
+      "tag": "wg",
       "port": 12345,
       "protocol": "dokodemo-door",
       "settings": { "network": "tcp,udp", "followRedirect": true },
@@ -154,6 +157,147 @@ apply_wg() {
   wg_config > /etc/wireguard/wg0.conf
   chmod 600 /etc/wireguard/wg0.conf
   wg syncconf wg0 <(wg-quick strip wg0)
+  systemctl try-restart cascade-watch   # чтобы лог узнал новых клиентов
+}
+
+# ---------- Подробные логи: одинаково на обоих серверах (второму передаётся через ssh) ----------
+# Xray пишет каждое соединение в /var/log/xray/access.log, подробности и ошибки — в error.log.
+# Здесь: ротация логов, статистика sysstat раз в минуту и журнал TCP-соединений со вторым сервером.
+logs_setup() {
+  PEER=$1   # IP второго сервера
+  mkdir -p /var/log/cascade
+  # ротация раз в сутки, храним 14 дней
+  cat > /etc/logrotate.d/cascade <<'EOF'
+/var/log/xray/*.log /var/log/cascade/*.log {
+  daily
+  rotate 14
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+  # sysstat: снимок раз в минуту, плюс TCP/UDP-счётчики (смотреть: sar -n DEV,ETCP), храним 14 дней
+  sed -i 's/^SADC_OPTIONS=.*/SADC_OPTIONS="-S DISK,SNMP"/; s/^HISTORY=.*/HISTORY=14/' /etc/sysstat/sysstat
+  mkdir -p /etc/systemd/system/sysstat-collect.timer.d
+  printf '[Timer]\nOnCalendar=\nOnCalendar=*:*:00\n' > /etc/systemd/system/sysstat-collect.timer.d/cascade.conf
+  # открытие (SYN) и обрыв (RST) каждого TCP-соединения со вторым сервером;
+  # повтор SYN без ответа — значит, пакеты до второго сервера не доходят
+  cat > /etc/systemd/system/cascade-tcp.service <<EOF
+[Unit]
+Description=cascade: TCP-соединения с $PEER
+After=network-online.target
+
+[Service]
+ExecStart=/bin/sh -c 'tcpdump -i any -nn -l -tttt "host $PEER and tcp port 443 and tcp[tcpflags] & (tcp-syn|tcp-rst) != 0" 2>/dev/null | cat >> /var/log/cascade/tcp.log'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl restart sysstat-collect.timer
+  systemctl enable -q cascade-tcp
+  systemctl restart cascade-tcp
+}
+
+# ---------- Лог по клиентам: /var/log/cascade/<имя>.log (служба cascade-watch, только RU) ----------
+# Пишет: события WireGuard из ядра (рукопожатия, ошибки), трафик клиента за каждую минуту
+# и каждое его соединение через Xray. Клиенты без событий в файл не пишутся.
+watch_setup() {
+  cat > /etc/systemd/system/cascade-watch.service <<EOF
+[Unit]
+Description=cascade: логи по клиентам
+After=wg-quick@wg0.service xray.service
+
+[Service]
+ExecStart=/usr/local/bin/cascade watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable -q cascade-watch
+  systemctl restart cascade-watch
+}
+
+cmd_watch() {
+  mkdir -p $LOGS
+  echo 'module wireguard +p' > /proc/dynamic_debug/control   # ядро начинает писать события WireGuard
+  declare -A NAME   # публичный ключ или адрес 10.66.66.N -> имя клиента
+  for f in $CLIENTS/*.conf; do
+    [ -f "$f" ] || continue
+    NAME[$(grep PrivateKey $f | cut -d' ' -f3 | wg pubkey)]=$(basename $f .conf)
+    NAME[$(grep Address $f | cut -d' ' -f3 | cut -d/ -f1)]=$(basename $f .conf)
+  done
+  log() { printf '%(%F %T)T %s\n' -1 "$2" >> $LOGS/${1:-unknown}.log; }
+
+  # 1) трафик каждого клиента за минуту: сколько пришло от него и сколько ушло ему
+  (declare -A RX TX
+   while sleep 60; do
+     while read -r pub _ ep _ hs rx tx _; do
+       old_rx=${RX[$pub]:-}; old_tx=${TX[$pub]:-}
+       RX[$pub]=$rx; TX[$pub]=$tx
+       [ -n "$old_rx" ] && [ "$rx" -ge "$old_rx" ] && [ "$tx" -ge "$old_tx" ] || continue  # первый замер или сброс счётчиков
+       [ $((rx + tx)) -gt $((old_rx + old_tx)) ] || continue                              # трафика не было
+       [ "$hs" = 0 ] && ago=нет || ago="$(( $(date +%s) - hs )) с назад"
+       log "${NAME[$pub]:-}" "трафик за минуту: от клиента $(numfmt --to=iec $((rx - old_rx))), клиенту $(numfmt --to=iec $((tx - old_tx))); рукопожатие: $ago; адрес: $ep"
+     done < <(wg show wg0 dump | tail -n +2)
+   done) &
+
+  # 2) события WireGuard из ядра. Не пишем keepalive (каждые 25 с, их видно по трафику)
+  #    и IPv6-пакеты, которые сервер отбрасывает (unallowed src IP): их сотни в минуту
+  (declare -A PEER   # номер peer в ядре -> имя клиента
+   journalctl -k -f -n 0 -o cat | grep --line-buffered 'wg0: ' | grep --line-buffered -vE 'keepalive|unallowed src IP' |
+   while read -r line; do
+     msg=${line#*wg0: }
+     id=; ep=; name=
+     [[ $msg =~ peer\ ([0-9]+) ]] && id=${BASH_REMATCH[1]}
+     [[ $msg =~ \(([^\)]+)\)$ || $msg =~ from\ ([^ ]+)$ ]] && ep=${BASH_REMATCH[1]}
+     [ -n "$id" ] && name=${PEER[$id]:-}
+     if [ -z "$name" ] && [ -n "$ep" ]; then   # номер ещё не знаем — ищем клиента по адресу, потом по IP
+       pub=$(wg show wg0 endpoints | awk -v ep="$ep" -v ip="${ep%:*}:" '$2 == ep {print $1; exit} index($2, ip) == 1 {p = $1} END {print p}' | head -1)
+       [ -n "$pub" ] && name=${NAME[$pub]:-}
+       [ -n "$id" ] && [ -n "$name" ] && PEER[$id]=$name
+     fi
+     log "$name" "WireGuard: $msg"
+   done) &
+
+  # 3) соединения через Xray из error.log: у каждого соединения свой номер [id].
+  #    По строке "received request for 10.66.66.N" узнаём клиента, дальше пишем сайт и маршрут,
+  #    а все необычные строки (ошибки, обрывы) — как есть.
+  (declare -A SESS   # номер соединения -> имя клиента
+   tail -F -n 0 /var/log/xray/error.log 2>/dev/null | while read -r d t lvl id msg; do
+     id=${id//[\[\]]/}
+     [ -n "$id" ] || continue
+     t="${d//\//-} ${t%.*}"
+     case $msg in
+       "proxy/dokodemo: received request for "*)
+         ip=${msg##* }; ip=${ip%:*}
+         [ ${#SESS[@]} -lt 50000 ] || SESS=()   # чтобы не копить память
+         [ -n "${NAME[$ip]:-}" ] && SESS[$id]=${NAME[$ip]} ;;
+       *)
+         n=${SESS[$id]:-}
+         [ -n "$n" ] || continue
+         case $msg in
+           *"default route for "*)  echo "$t xray: ${msg##* } -> abroad" ;;
+           *"taking detour ["*)     r=${msg#*detour [}; x=${msg##*for [}; echo "$t xray: ${x%]} -> ${r%%]*}" ;;
+           *"sniffed domain"*|*"is dialing to"*|*"tunneling request"*|*"dialing TCP"*|*"connection opened"*) continue ;;
+           *)                       echo "$t xray $lvl [$id]: $msg" ;;
+         esac >> $LOGS/$n.log ;;
+     esac
+   done) &
+
+  wait -n; exit 1   # если какая-то часть остановилась — systemd перезапустит службу
+}
+
+cmd_log() {
+  [ -f "$LOGS/$1.log" ] || { echo "Использование: cascade log <имя>. Есть логи: $(cd $LOGS 2>/dev/null && ls *.log | sed 's/\.log$//' | tr '\n' ' ')"; exit 1; }
+  tail -n 100 -f "$LOGS/$1.log"
 }
 
 # ---------- Правила: трафик из wg0 -> Xray (порт 12345). Вызываются из wg0.conf ----------
@@ -192,7 +336,7 @@ cmd_install() {
 
   echo "== 1/5 Пакеты и Xray на этом сервере"
   apt-get -o DPkg::Lock::Timeout=300 update -qq
-  apt-get -o DPkg::Lock::Timeout=300 install -y -qq curl openssl wireguard-tools qrencode iptables ufw >/dev/null
+  apt-get -o DPkg::Lock::Timeout=300 install -y -qq curl openssl wireguard-tools qrencode iptables ufw tcpdump sysstat >/dev/null
   bash -c "$(curl -fsSL $XRAY_INSTALL)" @ install >/dev/null
   make_env
 
@@ -207,7 +351,7 @@ cmd_install() {
   ssh root@$DE_IP 'bash -s' <<'EOF'
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 apt-get -o DPkg::Lock::Timeout=300 update -qq
-apt-get -o DPkg::Lock::Timeout=300 install -y -qq curl ufw >/dev/null
+apt-get -o DPkg::Lock::Timeout=300 install -y -qq curl ufw tcpdump sysstat >/dev/null
 bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null
 printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' > /etc/sysctl.d/90-bbr.conf
 sysctl -q --system
@@ -216,6 +360,7 @@ ufw allow 443/tcp >/dev/null
 ufw --force enable >/dev/null
 EOF
   de_config | ssh root@$DE_IP 'cat > /usr/local/etc/xray/config.json && xray run -test -c /usr/local/etc/xray/config.json >/dev/null && systemctl enable -q xray && systemctl restart xray'
+  ssh root@$DE_IP "$(declare -f logs_setup); logs_setup $(ru_ip)"
 
   echo "== 4/5 Этот сервер: Xray, WireGuard, firewall"
   ru_config > /usr/local/etc/xray/config.json
@@ -238,6 +383,8 @@ EOF
   chmod 600 /etc/wireguard/wg0.conf
   systemctl enable -q wg-quick@wg0
   systemctl restart wg-quick@wg0
+  logs_setup $DE_IP
+  watch_setup
 
   echo "== 5/5 Проверка"
   sleep 3
@@ -332,7 +479,9 @@ case "$1" in
   list)       cmd_list ;;
   status)     cmd_status ;;
   test)       cmd_test ;;
+  log)        cmd_log "$2" ;;
+  watch)      cmd_watch ;;
   rules-up)   rules_up ;;
   rules-down) rules_down ;;
-  *)          sed -n '2,16p' "$0" ;;
+  *)          sed -n '2,17p' "$0" ;;
 esac
